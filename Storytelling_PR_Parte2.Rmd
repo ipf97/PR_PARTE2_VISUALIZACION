@@ -1,0 +1,365 @@
+---
+title: "PRÁCTICA PARTE II: Descubriendo los patrones de precios y demanda en los 
+        alojamientos en la ciudad de Valencia"
+author: "Imanol Pérez Fernández"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cerulean
+    highlight: tango
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+runtime: shiny
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(ggplot2)
+library(leaflet)
+library(ggmap)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(ggthemes)
+library(treemapify)
+library(reshape2)
+library(plotly)
+library(shiny)
+library(viridis)
+library(RColorBrewer)
+```
+
+# Introducción
+
+Este análisis busca descubrir cómo varían los precios y las demandas de los 
+alojamientos en Valencia, con un enfoque especial en las diferencias entre 
+barrios, tipos de alojamiento, y cómo influyen las condiciones socioeconómicas 
+y la valoración de los huéspedes. Más allá de las cifras, esta visualización 
+está pensada para guiar a tres tipos de audiencia:
+
+* Curiosos sin conocimientos previos, que buscan entender la dinámica de los 
+alojamientos en Valencia.
+* Expertos en datos o urbanismo, interesados en patrones y tendencias profundas.
+* Inversores inmobiliarios, que desean tomar decisiones informadas para 
+maximizar retornos.
+
+# Una vista panorámica de los precios por barrio y tipo de alojamiento
+
+## Mapa de calor
+```{r}
+# Cargar datos
+data <- read.csv("Data/listings.csv")
+
+# Filtrar datos para excluir precios faltantes
+data_filtered <- data %>% filter(!is.na(price))
+
+# Definir la paleta de colores con el rango dinámico de precios
+price_palette <- colorNumeric(
+  palette = "RdYlBu", # Paleta de colores
+  domain = data_filtered$price # Rango de precios dinámico
+)
+
+# Crear un mapa interactivo con leaflet
+leaflet(data_filtered) %>%
+  addTiles() %>% # Capa base estándar de OpenStreetMap
+  addCircleMarkers(
+    lng = ~longitude, lat = ~latitude, # Coordenadas
+    color = ~price_palette(price), # Escala de colores basada en precios
+    radius = ~log(price + 1) * 2, # Tamaño de los puntos basado en el precio
+    stroke = FALSE, fillOpacity = 0.7, # Estilo de los marcadores
+    popup = ~paste0("<b>Precio: </b>", price, " €<br>",
+                    "<b>Barrio: </b>", neighbourhood_group, "<br>",
+                    "<b>Tipo: </b>", room_type) # Información al hacer clic
+  ) %>%
+  addLegend(
+    pal = price_palette,
+    values = ~price,
+    title = "Precio (€)",
+    position = "bottomright"
+  ) %>%
+  setView(
+    lng = mean(data_filtered$longitude, na.rm = TRUE), 
+    lat = mean(data_filtered$latitude, na.rm = TRUE),
+    zoom = 13
+  )
+```
+
+## Gráfico de violín
+
+```{r}
+# Filtrar datos para excluir precios faltantes
+data_filtered <- data %>% filter(!is.na(price) & price >= 0)
+
+# Interfaz de usuario
+ui <- fluidPage(
+  titlePanel("Distribución de precios por barrio"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput(
+        inputId = "selected_neighbourhood",
+        label = "Selecciona un barrio:",
+        choices = unique(data_filtered$neighbourhood_group),
+        selected = unique(data_filtered$neighbourhood_group)[1]
+      )
+    ),
+    mainPanel(
+      plotlyOutput("violinPlot") 
+    )
+  )
+)
+
+# Lógica del servidor
+server <- function(input, output) {
+  output$violinPlot <- renderPlotly({
+    # Filtrar los datos según el barrio seleccionado
+    filtered_data <- data_filtered %>%
+      filter(neighbourhood_group == input$selected_neighbourhood)
+    
+    # Crear el gráfico de violín con medianas
+    p <- ggplot(filtered_data, aes(x = room_type, y = price, 
+                                   fill = room_type)) +
+      geom_violin(trim = FALSE) + # Agrega violines completos
+      stat_summary(
+        fun = median, geom = "point", shape = 23, size = 3, color = "black", 
+        fill = "white"
+      ) + # Añade la mediana como un punto
+      theme_minimal() +
+      labs(
+        title = paste("Distribución de precios en", 
+                      input$selected_neighbourhood),
+        x = "Tipo de alojamiento",
+        y = "Precio",
+        fill = "Tipo de alojamiento"
+      )
+    
+    # Convertir el gráfico a plotly para interactividad
+    ggplotly(p, tooltip = c("y"))
+  })
+}
+
+# Ejecutar la aplicación shiny
+shinyApp(ui = ui, server = server)
+```
+
+## Bubble Plots precios medios por barrio
+
+```{r}
+# Agrupar datos para cálculo del precio medio y número de alojamientos
+bubble_data <- data_filtered %>%
+  group_by(neighbourhood_group, neighbourhood) %>%
+  summarise(
+    mean_price = mean(price, na.rm = TRUE),
+    count = n()
+  ) %>%
+  ungroup()
+
+# Crear el gráfico de burbujas
+ggplot(bubble_data, aes(x = neighbourhood_group, y = mean_price, size = count, 
+                        fill = mean_price)) +
+  geom_point(shape = 21, alpha = 0.7) +
+  scale_size_continuous(name = "Cantidad de alojamientos") +
+  scale_fill_gradient(low = "blue", high = "red", name = "Precio medio (€)") +
+  theme_minimal() +
+  labs(
+    title = "Relación entre precio medio y cantidad de alojamientos por barrio",
+    x = "Grupo de barrios",
+    y = "Precio medio (€)"
+  ) +
+  theme(
+    legend.position = "right",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+# Evolución de los precios a lo largo del tiempo
+
+## Gráfico de áreas apiladas
+
+```{r}
+# Filtrar y preparar datos
+data_filtered <- data_filtered %>%
+  mutate(last_review_date = as.Date(last_review)) %>%
+  filter(!is.na(last_review_date))
+
+time_data <- data_filtered %>%
+  group_by(last_review_date, neighbourhood_group) %>%
+  summarise(mean_price = mean(price, na.rm = TRUE)) %>%
+  ungroup()
+
+# Generar una paleta de colores dinámica para los barrios
+num_groups <- length(unique(time_data$neighbourhood_group))
+color_palette <- brewer.pal(min(num_groups, 8), "Set1") # Hasta 8 colores Set1
+if (num_groups > 8) {
+  color_palette <- colorRampPalette(brewer.pal(8, "Set1"))(num_groups)
+}
+
+# Crear el gráfico con colores contrastantes
+ggplot(time_data, aes(x = last_review_date, y = mean_price, 
+                      fill = neighbourhood_group)) +
+  geom_area(alpha = 0.8) +
+  scale_fill_manual(
+    values = color_palette, # Paleta dinámica basada en el número de barrios
+    name = "Barrio"
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Evolución de precios por barrio",
+    x = "Fecha",
+    y = "Precio medio",
+    fill = "Barrio"
+  ) +
+  theme(
+    legend.position = "right",
+    text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+# La experiencia del huésped y su impacto en el mercado
+
+## Gráfico de dispersión
+
+```{r}
+# Crear el gráfico mejorado con facetas, sin líneas de tendencia
+ggplot(data_filtered, aes(x = reviews_per_month, y = price, 
+                          size = number_of_reviews, color = room_type)) +
+  geom_point(alpha = 0.6) + # Puntos para representar los datos
+  facet_wrap(~ room_type, scales = "free") + # Facetas por tipo de alojamiento
+  scale_color_manual(values = c("red", "blue", "green", "purple")) + 
+  theme_minimal() +
+  labs(
+    title = "Relación entre reseñas y precios por tipo de alojamiento",
+    x = "Reseñas por mes",
+    y = "Precio (€)",
+    size = "Número de reseñas",
+    color = "Tipo de alojamiento"
+  ) +
+  theme(
+    legend.position = "right",
+    text = element_text(size = 12)
+  )
+```
+
+## Mapa de calor de correlaciones
+
+```{r}
+# Preparar los datos para la matriz de correlación
+corr_data <- data_filtered %>%
+  select(reviews_per_month, price, number_of_reviews, availability_365) %>%
+  drop_na()
+
+cor_matrix <- cor(corr_data)
+
+# Convertir la matriz de correlación en formato largo
+cor_melted <- melt(cor_matrix)
+
+# Crear el mapa de calor mejorado
+ggplot(cor_melted, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "black", size = 0.5) + # Bordes negros para las celdas
+  geom_text(aes(label = round(value, 2)), color = "black", size = 4) + 
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = 0,
+                       limits = c(-1, 1), breaks = seq(-1, 1, by = 0.2)) + 
+  theme_minimal() +
+  labs(
+    title = "Matriz de correlación con anotaciones",
+    x = "Variable",
+    y = "Variable",
+    fill = "Correlación"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    text = element_text(size = 12),
+    panel.grid = element_blank()
+  )
+```
+
+# Patrones estacionales y geográficos en la demanda y el precio
+
+## Calendario de calor
+```{r}
+# Preparar los datos
+data_filtered <- data_filtered %>%
+  mutate(review_month = floor_date(last_review_date, "month")) %>%
+  filter(!is.na(review_month))
+
+calendar_data <- data_filtered %>%
+  group_by(review_month) %>%
+  summarise(avg_reviews = mean(reviews_per_month, na.rm = TRUE)) %>%
+  ungroup()
+
+# Crear el gráfico de línea con ggplot
+p <- ggplot(calendar_data, aes(x = review_month, y = avg_reviews)) +
+  geom_line(color = "blue", size = 1) + # Línea azul más visible
+  theme_minimal() +
+  labs(
+    title = "Patrones estacionales de demanda",
+    x = "Mes",
+    y = "Promedio de reseñas"
+  )
+
+# Convertir el gráfico en interactivo con plotly
+ggplotly(p, tooltip = c("x", "y"))
+```
+
+## Gráfico de líneas facetado
+
+```{r}
+# Preparar los datos
+data_filtered <- data_filtered %>%
+  mutate(review_month = floor_date(last_review_date, "month")) %>%
+  filter(!is.na(review_month))
+
+facet_data <- data_filtered %>%
+  group_by(review_month, neighbourhood_group) %>%
+  summarise(
+    mean_price = mean(price, na.rm = TRUE),
+    avg_reviews = mean(reviews_per_month, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Interfaz de usuario
+ui <- fluidPage(
+  titlePanel("Evolución de precios por barrio"),
+  sidebarLayout(
+    sidebarPanel(
+      selectInput(
+        inputId = "selected_neighbourhood",
+        label = "Selecciona un barrio:",
+        choices = unique(facet_data$neighbourhood_group),
+        selected = unique(facet_data$neighbourhood_group)[1]
+      )
+    ),
+    mainPanel(
+      plotlyOutput("linePlot") # Gráfico interactivo con plotly
+    )
+  )
+)
+
+# Lógica del servidor
+server <- function(input, output) {
+  output$linePlot <- renderPlotly({
+    # Filtrar los datos según el barrio seleccionado
+    filtered_data <- facet_data %>%
+      filter(neighbourhood_group == input$selected_neighbourhood)
+    
+    # Crear el gráfico de línea
+    p <- ggplot(filtered_data, aes(x = review_month, y = mean_price)) +
+      geom_line(color = "blue", size = 1) +
+      theme_minimal() +
+      labs(
+        title = paste("Evolución de precios en", input$selected_neighbourhood),
+        x = "Mes",
+        y = "Precio medio (€)"
+      )
+    
+    # Convertir el gráfico a interactivo
+    ggplotly(p, tooltip = c("x", "y"))
+  })
+}
+
+# Ejecutar la aplicación shiny
+shinyApp(ui = ui, server = server)
+```
